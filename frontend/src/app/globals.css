@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+:root {
+  --bg:        #0a0e1a;
+  --surface:   #111827;
+  --card:      #1a2235;
+  --border:    #1e3a5f;
+  --accent:    #00d4ff;
+  --warning:   #f59e0b;
+  --danger:    #ef4444;
+  --success:   #10b981;
+  --text:      #f1f5f9;
+  --muted:     #64748b;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', sans-serif;
+  margin: 0;
+  padding: 0;
+}
+
+/* custom scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--surface); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+
+/* glow pulse animation */
+@keyframes glow-pulse {
+  0%, 100% { box-shadow: 0 0 6px 2px rgba(239,68,68,0.4); }
+  50%       { box-shadow: 0 0 18px 6px rgba(239,68,68,0.9); }
+}
+.glow-pulse { animation: glow-pulse 1.4s ease-in-out infinite; }
+
+@keyframes glow-amber {
+  0%, 100% { box-shadow: 0 0 6px 2px rgba(245,158,11,0.4); }
+  50%       { box-shadow: 0 0 14px 4px rgba(245,158,11,0.8); }
+}
+.glow-amber { animation: glow-amber 2s ease-in-out infinite; }
+
+/* flow animation */
+@keyframes flow {
+  from { stroke-dashoffset: 24; }
+  to   { stroke-dashoffset: 0; }
+}
+.flow-arrow { animation: flow 1.2s linear infinite; }
+
+/* scan line overlay */
+@keyframes scan {
+  0%   { transform: translateY(-100%); }
+  100% { transform: translateY(100vh); }
+}
