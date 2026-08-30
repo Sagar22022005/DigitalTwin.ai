@@ -111,7 +111,7 @@ npm run dev -- -p 3000
 3. Open the application at:
 
 ```text
-http://localhost:3000
+https://digital-twin-ai-three.vercel.app/
 ```
 
 ---
