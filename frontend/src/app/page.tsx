@@ -1,5 +1,5 @@
 "use client";
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { AnimatePresence } from "framer-motion";
 import { Activity, Bell, Zap } from "lucide-react";
 import { StationStatus, Alert, WSMessage } from "@/types";
@@ -30,13 +30,20 @@ export default function LiveFloorPage() {
       .catch(() => {});
   }, []);
 
+  const activeSessionRef = useRef<number>(1);
+
   const handleWS = useCallback((msg: WSMessage) => {
     setWsConnected(true);
     if (msg.type === "init") {
       setAlerts(msg.alerts);
     } else if (msg.type === "station_update") {
+      if (msg.data.sim_session_id != null && msg.data.sim_session_id !== activeSessionRef.current) {
+        return; // Discard stale telemetry from previous simulation session
+      }
       setStations((prev) => ({ ...prev, [msg.data.station_id]: msg.data }));
-      setVehicles((v) => v + 1);
+      if (msg.data.vehicles_completed != null) {
+        setVehicles(msg.data.vehicles_completed);
+      }
     } else if (msg.type === "alert") {
       setAlerts((prev) => [...prev.filter(a => a.id !== msg.alert.id), msg.alert]);
     } else if (msg.type === "alert_resolved") {
@@ -44,7 +51,12 @@ export default function LiveFloorPage() {
         prev.map((a) => a.id === msg.alert_id ? { ...a, status: "approved" } : a)
       );
     } else if (msg.type === "reset") {
+      if (msg.sim_session_id != null) {
+        activeSessionRef.current = msg.sim_session_id;
+      }
+      setStations({});
       setAlerts([]);
+      setVehicles(0);
     }
   }, []);
 

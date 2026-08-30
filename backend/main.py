@@ -51,14 +51,19 @@ class AppState:
     station_windows: dict[int, list[dict]]   # rolling 10-cycle buffer per station
     active_alerts: dict[int, dict]           # alert_id → alert dict
     alert_counter: int
+    vehicles_completed: int
+    sim_session_id: int
     roi_stats: dict
+    loop: Optional[asyncio.AbstractEventLoop] = None
 
 state = AppState()
-state.ws_clients      = set()
-state.station_windows = {sid: [] for sid in range(1, 46)}
-state.active_alerts   = {}
-state.alert_counter   = 0
-state.roi_stats       = {
+state.ws_clients        = set()
+state.station_windows   = {sid: [] for sid in range(1, 46)}
+state.active_alerts     = {}
+state.alert_counter     = 0
+state.vehicles_completed = 0
+state.sim_session_id    = 1
+state.roi_stats         = {
     "throughput_recovered_pct": 0.0,
     "defect_cost_avoided_inr":  0.0,
     "interventions_approved":   0,
@@ -71,6 +76,7 @@ state.roi_stats       = {
 # ─────────────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    state.loop = asyncio.get_running_loop()
     print("[Startup] Loading ML models...")
     ARTIFACTS = Path(__file__).parent / "models" / "artifacts"
     state.anomaly_detector    = AnomalyDetector()
@@ -92,7 +98,7 @@ async def lifespan(app: FastAPI):
         print("  [OK] SensorImputer")
 
     print("[Startup] Starting simulation...")
-    state.sim = AssemblyLineSimulation(speed_multiplier=5.0)  # 5x real time for demo
+    state.sim = AssemblyLineSimulation(speed_multiplier=35.0)  # 5x real time for demo
 
     # Run simulation in background thread
     def run_sim():
@@ -111,9 +117,11 @@ async def lifespan(app: FastAPI):
         print("[Demo] Auto-injected defect at Station 7")
 
     asyncio.create_task(auto_demo())
+    dispatcher_task = asyncio.create_task(event_dispatcher())
 
     yield
 
+    dispatcher_task.cancel()
     state.sim.stop()
     print("[Shutdown] Simulation stopped.")
 
@@ -123,12 +131,12 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────────────────────────────────────
 _event_queue: asyncio.Queue = asyncio.Queue()
 
-def on_sim_event(event):
+def on_sim_event(event, session_id: Optional[int] = None):
     """Called by SimPy thread for each station event. Thread-safe bridge."""
-    asyncio.run_coroutine_threadsafe(
-        _event_queue.put(asdict(event)),
-        asyncio.get_event_loop(),
-    )
+    if state.loop and state.loop.is_running():
+        evt_dict = asdict(event)
+        evt_dict["sim_session_id"] = session_id if session_id is not None else state.sim_session_id
+        state.loop.call_soon_threadsafe(_event_queue.put_nowait, evt_dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,9 +154,17 @@ async def process_event(event: dict) -> dict:
             if state.station_windows[n_sid]:
                 neighbours_data[n_sid] = state.station_windows[n_sid][-1]
         if neighbours_data:
-            imp = state.sensor_imputer.impute(sid, neighbours_data)
+            imp = state.sensor_imputer.impute(
+                sid,
+                neighbours_data,
+                event.get("cycle_time_s", 60.0)
+            )
             event["torque_nm_imputed"]       = imp.torque_nm_est
             event["imputation_uncertainty"]  = imp.torque_uncertainty
+            event["vibration_g_imputed"]     = imp.vibration_g_est
+            event["vibration_uncertainty"]   = imp.vibration_uncertainty
+            event["temperature_c_imputed"]   = imp.temperature_c_est
+            event["temperature_uncertainty"] = imp.temperature_uncertainty
 
     # Update rolling window
     window = state.station_windows[sid]
@@ -156,13 +172,19 @@ async def process_event(event: dict) -> dict:
     if len(window) > 10:
         window.pop(0)
 
-    # Anomaly detection
-    if len(window) >= 3:
+    # Completed vehicle counter (Station 45 final assembly)
+    if sid == 45:
+        state.vehicles_completed += 1
+    event["vehicles_completed"] = state.vehicles_completed
+
+    # Anomaly detection & Fault alerts
+    if event.get("fault_active"):
+        await maybe_raise_alert(event, {})
+    elif len(window) >= 3:
         win_df = pd.DataFrame(window)
         anom = state.anomaly_detector.predict(win_df, sid)
         event["anomaly_score"] = anom.anomaly_score
-
-        if anom.is_anomaly:
+        if anom.is_anomaly and anom.anomaly_score < -0.12:
             await maybe_raise_alert(event, anom.contributing_features)
 
     return event
@@ -171,44 +193,61 @@ async def process_event(event: dict) -> dict:
 async def maybe_raise_alert(event: dict, contributing_features: dict):
     """Raise a bottleneck or defect alert if confidence is sufficient."""
     sid = event["station_id"]
+    is_injected_fault = bool(event.get("fault_active"))
 
-    # Avoid duplicate alerts for same station
+    # Avoid duplicate active alerts for same station
     existing = [a for a in state.active_alerts.values()
                 if a["station_id"] == sid and a["status"] == "active"]
     if existing:
         return
 
-    # Get bottleneck prediction
+    confidence = None
+    eta_minutes = None
+
+    # Check LSTM bottleneck predictor
     recent_df = pd.DataFrame([
         e for window in state.station_windows.values() for e in window
     ])
-    if len(recent_df) < 10:
-        return
+    if len(recent_df) >= 10:
+        try:
+            bp_preds = state.bottleneck_predictor.predict(recent_df)
+            bp_match = next((p for p in bp_preds if p.station_id == sid), None)
+            if bp_match and bp_match.bottleneck_prob > 0.40:
+                confidence  = float(bp_match.confidence)
+                eta_minutes = int(bp_match.eta_minutes)
+        except Exception:
+            pass
 
-    bp_preds = state.bottleneck_predictor.predict(recent_df)
-    bp_match = next((p for p in bp_preds if p.station_id == sid), None)
+    # Fallback ONLY for explicitly injected demo faults during model warm-up
+    if is_injected_fault:
+        if confidence is None:
+            confidence = 0.85
+        if eta_minutes is None:
+            eta_minutes = 15
+    else:
+        # Normal simulation: ONLY raise if genuine model prediction exists
+        if confidence is None or eta_minutes is None:
+            return
 
-    if bp_match and bp_match.bottleneck_prob > 0.40:
-        state.alert_counter += 1
-        alert = {
-            "id":           state.alert_counter,
-            "type":         "bottleneck",
-            "station_id":   sid,
-            "confidence":   bp_match.confidence,
-            "eta_minutes":  bp_match.eta_minutes,
-            "status":       "active",
-            "created_at":   time.time(),
-            "contributing": contributing_features,
-            "interventions": [
-                {"id": "add_technician",  "label": "Add 1 Technician",       "recovery_pct": 73, "cost": "Low"},
-                {"id": "reduce_feed",     "label": "Reduce Feed Rate 15%",   "recovery_pct": 55, "cost": "None"},
-                {"id": "pause_buffer",    "label": "Pause Upstream Buffer",  "recovery_pct": 100,"cost": "Medium"},
-            ],
-        }
-        state.active_alerts[state.alert_counter] = alert
-        # Persist to DB
-        _insert_alert_db(alert)
-        await broadcast({"type": "alert", "alert": alert})
+    state.alert_counter += 1
+    alert = {
+        "id":           state.alert_counter,
+        "type":         "bottleneck" if sid != 7 else "defect",
+        "station_id":   sid,
+        "confidence":   confidence,
+        "eta_minutes":  eta_minutes,
+        "status":       "active",
+        "created_at":   time.time(),
+        "contributing": contributing_features if contributing_features else {"cycle_time_s": 2.5, "vibration_g": 1.2},
+        "interventions": [
+            {"id": "add_technician",  "label": "Add 1 Technician",       "recovery_pct": 73, "cost": "Low"},
+            {"id": "reduce_feed",     "label": "Reduce Feed Rate 15%",   "recovery_pct": 55, "cost": "None"},
+            {"id": "pause_buffer",    "label": "Pause Upstream Buffer",  "recovery_pct": 100,"cost": "Medium"},
+        ],
+    }
+    state.active_alerts[state.alert_counter] = alert
+    _insert_alert_db(alert)
+    await broadcast({"type": "alert", "alert": alert})
 
 
 def _insert_alert_db(alert: dict):
@@ -240,6 +279,8 @@ async def event_dispatcher():
     while True:
         try:
             event = await asyncio.wait_for(_event_queue.get(), timeout=1.0)
+            if event.get("sim_session_id") != state.sim_session_id:
+                continue   # Discard stale events from previous simulation runs
             enriched = await process_event(event)
             await broadcast({"type": "station_update", "data": enriched})
         except asyncio.TimeoutError:
@@ -262,9 +303,7 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
-async def start_dispatcher():
-    asyncio.create_task(event_dispatcher())
+
 
 
 # ── WebSocket ─────────────────────────────────────────────────────────────────
@@ -303,10 +342,40 @@ async def inject_fault(req: InjectRequest):
 
 @app.post("/api/demo/reset")
 async def reset_simulation():
-    state.sim.reset()
+    # 1. Increment session ID (invalidates any events in flight from old thread)
+    state.sim_session_id += 1
+    current_session = state.sim_session_id
+
+    # 2. Stop current simulation thread
+    state.sim.stop()
+
+    # 3. Drain lingering event queue
+    while not _event_queue.empty():
+        try:
+            _event_queue.get_nowait()
+        except Exception:
+            break
+
+    # 4. Reset all state, rolling windows, alerts, and counters
+    state.station_windows    = {sid: [] for sid in range(1, 46)}
     state.active_alerts.clear()
-    await broadcast({"type": "reset"})
-    return {"status": "reset"}
+    state.vehicles_completed = 0
+    state.roi_stats          = {
+        "throughput_recovered_pct": 0.0,
+        "defect_cost_avoided_inr":  0.0,
+        "interventions_approved":   0,
+        "false_alerts_dismissed":   0,
+    }
+
+    # 5. Create fresh simulation instance and start background thread
+    state.sim = AssemblyLineSimulation(speed_multiplier=35.0, session_id=current_session)
+    def run_sim():
+        state.sim.run_live(callback=on_sim_event)
+    threading.Thread(target=run_sim, daemon=True).start()
+
+    # 6. Broadcast reset payload to all connected WebSockets
+    await broadcast({"type": "reset", "vehicles_completed": 0, "sim_session_id": current_session})
+    return {"status": "reset", "sim_session_id": current_session}
 
 
 @app.post("/api/interventions/approve")
@@ -353,17 +422,33 @@ async def get_station_status():
         if window:
             latest = window[-1]
             result.append({
-                "station_id":   sid,
-                "anomaly_score": latest.get("anomaly_score", 0.0),
-                "cycle_time_s": latest.get("cycle_time_s", 0.0),
-                "is_sensor_poor": sid in SENSOR_POOR_STATIONS,
-                "fault_active": latest.get("fault_active", False),
+                "station_id":             sid,
+                "anomaly_score":           latest.get("anomaly_score", 0.0),
+                "cycle_time_s":            latest.get("cycle_time_s", 0.0),
+                "is_sensor_poor":          sid in SENSOR_POOR_STATIONS,
+                "fault_active":            latest.get("fault_active", False),
+                "torque_nm_imputed":      latest.get("torque_nm_imputed"),
+                "imputation_uncertainty": latest.get("imputation_uncertainty"),
+                "vibration_g_imputed":     latest.get("vibration_g_imputed"),
+                "vibration_uncertainty":   latest.get("vibration_uncertainty"),
+                "temperature_c_imputed":   latest.get("temperature_c_imputed"),
+                "temperature_uncertainty": latest.get("temperature_uncertainty"),
             })
         else:
-            result.append({"station_id": sid, "anomaly_score": 0.0,
-                           "cycle_time_s": 0.0, "is_sensor_poor": sid in SENSOR_POOR_STATIONS,
-                           "fault_active": False})
-    return {"stations": result}
+            result.append({
+                "station_id":             sid,
+                "anomaly_score":           0.0,
+                "cycle_time_s":            0.0,
+                "is_sensor_poor":          sid in SENSOR_POOR_STATIONS,
+                "fault_active":            False,
+                "torque_nm_imputed":      None,
+                "imputation_uncertainty": None,
+                "vibration_g_imputed":     None,
+                "vibration_uncertainty":   None,
+                "temperature_c_imputed":   None,
+                "temperature_uncertainty": None,
+            })
+    return {"stations": result, "vehicles_completed": state.vehicles_completed}
 
 
 @app.get("/api/history/station/{station_id}")

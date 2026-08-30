@@ -68,76 +68,32 @@ export default function DemoControls() {
           style={{ borderTop: "1px solid var(--border)" }}
         >
           {/* Bottleneck injection */}
-          <div className="flex flex-col gap-1.5 pt-3">
-            <label className="text-[10px] font-semibold tracking-wider"
-                   style={{ color: "var(--muted)" }}>
-              INJECT BOTTLENECK
-            </label>
-            <div className="flex gap-2">
-              <select
-                value={bStation}
-                onChange={(e) => setBStation(Number(e.target.value))}
-                className="flex-1 rounded-lg px-2 py-1.5 text-xs"
-                style={{
-                  background: "var(--card)",
-                  border: "1px solid var(--border)",
-                  color: "var(--text)",
-                }}
-              >
-                {STATIONS.map((s) => (
-                  <option key={s} value={s}>Station {s}</option>
-                ))}
-              </select>
-              <button
-                disabled={injecting}
-                onClick={() => inject("bottleneck", bStation)}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold"
-                style={{
-                  background: "rgba(239,68,68,0.15)",
-                  color: "var(--danger)",
-                  border: "1px solid rgba(239,68,68,0.4)",
-                }}
-              >
-                <Zap size={11} /> Inject
-              </button>
-            </div>
-          </div>
+          <button
+            disabled={injecting}
+            onClick={() => inject("bottleneck", 12)}
+            className="flex items-center justify-center gap-2 py-2 rounded-lg text-xs font-semibold mt-2"
+            style={{
+              background: "rgba(239,68,68,0.15)",
+              color: "var(--danger)",
+              border: "1px solid rgba(239,68,68,0.4)",
+            }}
+          >
+            <Zap size={12} /> Inject Bottleneck (Station 12)
+          </button>
 
           {/* Defect injection */}
-          <div className="flex flex-col gap-1.5">
-            <label className="text-[10px] font-semibold tracking-wider"
-                   style={{ color: "var(--muted)" }}>
-              INJECT DEFECT
-            </label>
-            <div className="flex gap-2">
-              <select
-                value={dStation}
-                onChange={(e) => setDStation(Number(e.target.value))}
-                className="flex-1 rounded-lg px-2 py-1.5 text-xs"
-                style={{
-                  background: "var(--card)",
-                  border: "1px solid var(--border)",
-                  color: "var(--text)",
-                }}
-              >
-                {STATIONS.filter(s => s <= 43).map((s) => (
-                  <option key={s} value={s}>Station {s}</option>
-                ))}
-              </select>
-              <button
-                disabled={injecting}
-                onClick={() => inject("defect", dStation)}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold"
-                style={{
-                  background: "rgba(245,158,11,0.15)",
-                  color: "var(--warning)",
-                  border: "1px solid rgba(245,158,11,0.4)",
-                }}
-              >
-                <Bug size={11} /> Inject
-              </button>
-            </div>
-          </div>
+          <button
+            disabled={injecting}
+            onClick={() => inject("defect", 7)}
+            className="flex items-center justify-center gap-2 py-2 rounded-lg text-xs font-semibold"
+            style={{
+              background: "rgba(245,158,11,0.15)",
+              color: "var(--warning)",
+              border: "1px solid rgba(245,158,11,0.4)",
+            }}
+          >
+            <Bug size={12} /> Inject Defect (Station 7)
+          </button>
 
           {/* Reset */}
           <button

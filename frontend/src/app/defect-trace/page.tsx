@@ -28,8 +28,8 @@ export default function DefectTracePage() {
   const riskColor = (p: number) =>
     p > 0.6 ? "#ef4444" : p > 0.25 ? "#f59e0b" : "#10b981";
 
-  const maxRisk    = Math.max(...journey.map((j) => j.defect_prob));
-  const originStn  = journey.reduce((a, b) => a.defect_prob > b.defect_prob ? a : b);
+  const maxRisk   = Math.max(...journey.map((j) => j.defect_prob));
+  const originStn = journey.find((j) => j.station_id === defectOrigin) ?? journey[0];
 
   return (
     <div className="max-w-5xl mx-auto p-6 flex flex-col gap-8">

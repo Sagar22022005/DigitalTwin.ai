@@ -1,11 +1,12 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import {
   LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid,
   Tooltip, ResponsiveContainer, Cell,
 } from "recharts";
-import { fetchJSON, formatINR } from "@/lib/utils";
-import { ThroughputPoint, ROIStats } from "@/types";
+import { fetchJSON, formatINR, stationColor, stationLabel } from "@/lib/utils";
+import { ThroughputPoint, ROIStats, StationStatus, Alert, WSMessage } from "@/types";
+import { useWebSocket } from "@/lib/useWebSocket";
 import { TrendingUp, DollarSign, ShieldCheck, Users } from "lucide-react";
 
 const TABS = ["Floor Supervisor", "Plant Manager", "Leadership"] as const;
@@ -61,16 +62,30 @@ const BOTTLENECK_DATA = [
 ];
 
 // ── Tab content ──────────────────────────────────────────────────────────────
-function SupervisorTab() {
+function SupervisorTab({
+  stations,
+  alerts,
+  vehicles,
+  roi,
+}: {
+  stations: Record<number, StationStatus>;
+  alerts: Alert[];
+  vehicles: number;
+  roi: ROIStats | null;
+}) {
+  const approvedAlertsCount = alerts.filter((a) => a.status === "approved").length + (roi?.interventions_approved ?? 0);
+  const activeStationsCount = Object.values(stations).filter((s) => s && s.cycle_time_s > 0).length;
+  const activeOperators = Math.min(8, Math.max(1, Math.ceil(activeStationsCount / 5)));
+
   return (
     <div className="flex flex-col gap-6">
       <p className="text-sm" style={{ color: "var(--muted)" }}>
         Real-time shift summary and active station status — open Live Floor for the interactive map.
       </p>
       <div className="grid grid-cols-3 gap-4">
-        <StatCard icon={TrendingUp}  label="Throughput (this shift)" value="312 vehicles" color="var(--accent)" />
-        <StatCard icon={ShieldCheck} label="Alerts resolved"         value="3"            color="var(--success)" />
-        <StatCard icon={Users}       label="Active operators"         value="6 / 8"        color="var(--warning)" />
+        <StatCard icon={TrendingUp}  label="Throughput (this shift)" value={`${vehicles} vehicles`} color="var(--accent)" />
+        <StatCard icon={ShieldCheck} label="Alerts resolved"         value={String(approvedAlertsCount)} color="var(--success)" />
+        <StatCard icon={Users}       label="Active operators"         value={`${activeOperators} / 8`} color="var(--warning)" />
       </div>
       <Card>
         <p className="text-xs font-semibold mb-4" style={{ color: "var(--muted)" }}>
@@ -78,14 +93,17 @@ function SupervisorTab() {
         </p>
         <div className="grid grid-cols-9 gap-2">
           {Array.from({ length: 45 }, (_, i) => {
-            const colours = ["#10b981","#10b981","#10b981","#f59e0b","#10b981",
-                             "#10b981","#10b981","#ef4444","#10b981","#10b981"];
-            const c = colours[i % colours.length];
+            const sid = i + 1;
+            const st = stations[sid];
+            const c = stationColor(st);
+            const lbl = stationLabel(st);
             return (
-              <div key={i}
-                className="flex items-center justify-center rounded-lg text-[9px] font-bold"
+              <div key={sid}
+                className="flex flex-col items-center justify-center rounded-lg text-[9px] font-bold"
+                title={`S${sid.toString().padStart(2, "0")}: ${lbl}`}
                 style={{ background: `${c}18`, border: `1px solid ${c}44`, color: c, height: 32 }}>
-                S{(i+1).toString().padStart(2,"0")}
+                <span>S{sid.toString().padStart(2, "0")}</span>
+                <span className="text-[7px] font-normal opacity-80">{lbl}</span>
               </div>
             );
           })}
@@ -275,13 +293,65 @@ export default function AnalyticsPage() {
   const [tab,        setTab]        = useState<Tab>("Floor Supervisor");
   const [throughput, setThroughput] = useState<ThroughputPoint[]>([]);
   const [roi,        setRoi]        = useState<ROIStats | null>(null);
+  const [stations,   setStations]   = useState<Record<number, StationStatus>>({});
+  const [alerts,     setAlerts]     = useState<Alert[]>([]);
+  const [vehicles,   setVehicles]   = useState(0);
+
+  const activeSessionRef = useRef<number>(1);
 
   useEffect(() => {
+    fetchJSON<{ stations: StationStatus[]; vehicles_completed?: number }>("/api/stations/status")
+      .then((data) => {
+        const map: Record<number, StationStatus> = {};
+        (data.stations || []).forEach((st) => { map[st.station_id] = st; });
+        setStations(map);
+        if (data.vehicles_completed != null) setVehicles(data.vehicles_completed);
+      })
+      .catch(() => {});
+
+    fetchJSON<{ alerts: Alert[] }>("/api/alerts")
+      .then(({ alerts: a }) => setAlerts(a))
+      .catch(() => {});
+
     fetchJSON<{ throughput: ThroughputPoint[] }>("/api/history/throughput")
       .then(({ throughput: t }) => setThroughput(t)).catch(() => {});
+
     fetchJSON<{ roi: ROIStats }>("/api/roi")
       .then(({ roi: r }) => setRoi(r)).catch(() => {});
   }, []);
+
+  const handleWS = useCallback((msg: WSMessage) => {
+    if (msg.type === "init") {
+      setAlerts(msg.alerts);
+    } else if (msg.type === "station_update") {
+      if (msg.data.sim_session_id != null && msg.data.sim_session_id !== activeSessionRef.current) {
+        return; // Discard stale telemetry from previous simulation session
+      }
+      setStations((prev) => ({ ...prev, [msg.data.station_id]: msg.data }));
+      if (msg.data.vehicles_completed != null) {
+        setVehicles(msg.data.vehicles_completed);
+      }
+    } else if (msg.type === "alert") {
+      setAlerts((prev) => [...prev.filter((a) => a.id !== msg.alert.id), msg.alert]);
+    } else if (msg.type === "alert_resolved") {
+      setAlerts((prev) =>
+        prev.map((a) => (a.id === msg.alert_id ? { ...a, status: "approved" } : a))
+      );
+      fetchJSON<{ roi: ROIStats }>("/api/roi")
+        .then(({ roi: r }) => setRoi(r)).catch(() => {});
+    } else if (msg.type === "reset") {
+      if (msg.sim_session_id != null) {
+        activeSessionRef.current = msg.sim_session_id;
+      }
+      setStations({});
+      setAlerts([]);
+      setVehicles(0);
+      fetchJSON<{ roi: ROIStats }>("/api/roi")
+        .then(({ roi: r }) => setRoi(r)).catch(() => {});
+    }
+  }, []);
+
+  useWebSocket(handleWS);
 
   return (
     <div className="max-w-6xl mx-auto p-6 flex flex-col gap-6">
@@ -311,7 +381,9 @@ export default function AnalyticsPage() {
       </div>
 
       {/* Tab content */}
-      {tab === "Floor Supervisor" && <SupervisorTab />}
+      {tab === "Floor Supervisor" && (
+        <SupervisorTab stations={stations} alerts={alerts} vehicles={vehicles} roi={roi} />
+      )}
       {tab === "Plant Manager"    && <ManagerTab throughput={throughput} />}
       {tab === "Leadership"       && <LeadershipTab roi={roi} />}
     </div>

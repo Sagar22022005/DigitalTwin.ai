@@ -30,6 +30,12 @@ ZONES = {
 # Stations with legacy/no sensors — only cycle_time + operator_id available
 SENSOR_POOR_STATIONS = {5, 11, 19, 23, 31, 37, 42}
 
+# Neighboring stations used for Gaussian Process sensor imputation
+NEIGHBOURS = {
+    sid: [max(1, sid - 1), min(45, sid + 1)]
+    for sid in SENSOR_POOR_STATIONS
+}
+
 # Normal operating parameters per zone (mean, std)
 ZONE_PARAMS = {
     "body":  {"cycle_time": (62.0, 3.5), "torque": (45.0, 4.0), "vibration": (0.8, 0.15), "temp": (38.0, 3.0)},
@@ -165,9 +171,9 @@ def _sample_metrics(
     # Base cycle time with optional bottleneck drift
     ct_mean, ct_std = params["cycle_time"]
     if fault_state.bottleneck_station == station_id and fault_state.bottleneck_start is not None:
-        elapsed = sim_time - fault_state.bottleneck_start
-        # Severity ramps over 40 minutes (2400 s), max +60% cycle time
-        fault_state.bottleneck_severity = min(elapsed / 2400.0, 1.0)
+        elapsed = max(0.0, sim_time - fault_state.bottleneck_start)
+        # Severity ramps over 25 seconds, max +60% cycle time
+        fault_state.bottleneck_severity = min(elapsed / 25.0, 1.0)
         ct_mean = ct_mean * (1.0 + 0.60 * fault_state.bottleneck_severity)
 
     cycle_time = max(5.0, rng.normal(ct_mean, ct_std))
@@ -200,14 +206,16 @@ class AssemblyLineSimulation:
         sim.inject_intervention("reduce_feed_rate", 12)
     """
 
-    def __init__(self, db_path: Path = DB_PATH, speed_multiplier: float = 1.0):
+    def __init__(self, db_path: Path = DB_PATH, speed_multiplier: float = 1.0, session_id: int = 1):
         self.db_path = db_path
         self.speed_multiplier = speed_multiplier  # >1 = faster than real time
+        self.session_id = session_id
         self.fault_state = FaultState()
         self.rng = np.random.default_rng(seed=42)
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._callback: Optional[Callable] = None
+        self._env = None
         init_db(db_path)
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -215,26 +223,27 @@ class AssemblyLineSimulation:
     def inject_fault(self, fault_type: str, station_id: int):
         """Inject a fault into the running simulation (thread-safe)."""
         with self._lock:
+            sim_now = self._env.now if self._env is not None else 0.0
             if fault_type == "bottleneck":
                 self.fault_state.bottleneck_station = station_id
-                self.fault_state.bottleneck_start = time.time()
+                self.fault_state.bottleneck_start = sim_now
                 self.fault_state.bottleneck_severity = 0.0
             elif fault_type == "defect":
                 self.fault_state.defect_station = station_id
-                self.fault_state.defect_start = time.time()
+                self.fault_state.defect_start = sim_now
                 self.fault_state.defect_torque_offset = self.rng.uniform(12.0, 20.0)
 
     def inject_intervention(self, option: str, station_id: int):
-        """Apply an approved intervention — reduces fault severity."""
+        """Apply an approved intervention — resolves fault and recovers station performance."""
         with self._lock:
-            if option == "add_technician" and self.fault_state.bottleneck_station == station_id:
-                self.fault_state.bottleneck_severity = max(0.0, self.fault_state.bottleneck_severity - 0.75)
-                self.fault_state.bottleneck_start = None  # halt further drift
-            elif option == "reduce_feed_rate" and self.fault_state.bottleneck_station == station_id:
-                self.fault_state.bottleneck_severity = max(0.0, self.fault_state.bottleneck_severity - 0.55)
-            elif option == "pause_buffer":
+            if self.fault_state.bottleneck_station == station_id:
                 self.fault_state.bottleneck_severity = 0.0
                 self.fault_state.bottleneck_station = None
+                self.fault_state.bottleneck_start = None
+            if self.fault_state.defect_station == station_id:
+                self.fault_state.defect_station = None
+                self.fault_state.defect_start = None
+                self.fault_state.defect_torque_offset = 0.0
 
     def reset(self):
         """Reset all faults (for demo purposes)."""
@@ -340,6 +349,7 @@ class AssemblyLineSimulation:
         self._callback = callback
         self._stop_event.clear()
         env = simpy.rt.RealtimeEnvironment(factor=1.0 / self.speed_multiplier, strict=False)
+        self._env = env
         sim_start_ts = time.time()
         vehicle_counter = [0]
 
@@ -378,12 +388,14 @@ class AssemblyLineSimulation:
                     fault_active=is_fault,
                 )
                 insert_event(evt, self.db_path)
-                if self._callback:
+                if not self._stop_event.is_set() and self._callback:
                     try:
-                        self._callback(evt)
+                        self._callback(evt, self.session_id)
                     except Exception:
                         pass
                 yield env.timeout(ct)
+                if self._stop_event.is_set():
+                    return
 
         def vehicle_spawner(env):
             vid = 0

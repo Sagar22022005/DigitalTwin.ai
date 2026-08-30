@@ -2,6 +2,7 @@ import { StationStatus } from "@/types";
 
 /** Maps anomaly_score → colour hex. Isolation Forest: negative = anomaly. */
 export function stationColor(station: StationStatus): string {
+  if (!station || station.cycle_time_s === 0) return "#475569";
   if (station.fault_active) return "#ef4444";        // confirmed fault
   const s = station.anomaly_score ?? 0;
   if (s < -0.05) return "#ef4444";                  // strong anomaly — red
@@ -10,6 +11,7 @@ export function stationColor(station: StationStatus): string {
 }
 
 export function stationLabel(station: StationStatus): string {
+  if (!station || station.cycle_time_s === 0) return "IDLE";
   if (station.fault_active) return "FAULT";
   const s = station.anomaly_score ?? 0;
   if (s < -0.05) return "ANOMALY";

@@ -12,6 +12,12 @@ export interface StationStatus {
   fault_active: boolean;
   torque_nm_imputed?: number | null;
   imputation_uncertainty?: number | null;
+  vibration_g_imputed?: number | null;
+  vibration_uncertainty?: number | null;
+  temperature_c_imputed?: number | null;
+  temperature_uncertainty?: number | null;
+  sim_session_id?: number;
+  vehicles_completed?: number;
 }
 
 export interface Alert {
@@ -52,4 +58,4 @@ export type WSMessage =
   | { type: "station_update"; data: StationStatus }
   | { type: "alert";          alert: Alert }
   | { type: "alert_resolved"; alert_id: number; option: string }
-  | { type: "reset" };
+  | { type: "reset";          sim_session_id?: number };

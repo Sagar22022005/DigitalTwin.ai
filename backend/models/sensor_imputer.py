@@ -132,7 +132,7 @@ class SensorImputer:
         self.save()
         print(f"[SensorImputer] Trained {len(self.gps)} GP models.")
 
-    def impute(self, station_id: int, neighbour_readings: dict) -> ImputationResult:
+    def impute(self, station_id: int, neighbour_readings: dict, station_cycle_time: float = 60.0) -> ImputationResult:
         """
         Impute all metrics for a sensor-poor station.
         neighbour_readings: {neighbour_station_id: {metric: value}}
@@ -158,9 +158,9 @@ class SensorImputer:
             scaler_X = self.scalers_X[key]
             scaler_y = self.scalers_y[key]
 
-            # Build feature row from neighbour readings
+            # Build feature row: station_cycle_time + neighbour readings
             neighbours = NEIGHBOURS[station_id]
-            feature_vals = []
+            feature_vals = [station_cycle_time]
             for n in neighbours:
                 if n in neighbour_readings:
                     nr = neighbour_readings[n]

@@ -26,6 +26,9 @@ yarn-error.log*
 # Database
 backend/data/telemetry.db
 *.sqlite3
+*.db-journal
+*.db-shm
+*.db-wal
 
 # Models / Artifacts (if you want to keep them out of source control)
 # backend/models/artifacts/*

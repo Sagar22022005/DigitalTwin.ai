@@ -123,8 +123,18 @@ export default function StationDrawer({ station, onClose }: Props) {
             unit="Nm"
             uncertain={station.is_sensor_poor ? station.imputation_uncertainty : null}
           />
-          <MetricRow label="Vibration"    value={station.vibration_g}    unit="g" />
-          <MetricRow label="Temperature"  value={station.temperature_c}  unit="°C" />
+          <MetricRow
+            label="Vibration"
+            value={station.vibration_g ?? station.vibration_g_imputed}
+            unit="g"
+            uncertain={station.is_sensor_poor ? station.vibration_uncertainty : null}
+          />
+          <MetricRow
+            label="Temperature"
+            value={station.temperature_c ?? station.temperature_c_imputed}
+            unit="°C"
+            uncertain={station.is_sensor_poor ? station.temperature_uncertainty : null}
+          />
         </div>
 
         {/* Fault status */}
