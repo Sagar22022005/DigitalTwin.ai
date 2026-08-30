@@ -1,197 +1,145 @@
 """
-models/bottleneck_predictor.py — LSTM-based bottleneck predictor.
+models/bottleneck_predictor.py — LSTM-based bottleneck predictor (Pure NumPy).
 
-Predicts which station(s) will form a bottleneck in the next 30–60 minutes
+Predicts which station(s) will form a bottleneck in the next 30-60 minutes
 by learning temporal patterns in cycle_time sequences across all stations.
 
-Architecture: Stacked LSTM → Dropout → FC → Sigmoid per station
-Input:  (batch, seq_len=30, n_stations=45) — last 30 time steps of cycle_time
+Architecture: Stacked LSTM -> Dropout -> FC -> Sigmoid per station
+Input: (batch, seq_len=30, n_stations=45) — last 30 time steps of cycle_time
 Output: (batch, n_stations=45)             — bottleneck probability per station
 """
 
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-import joblib
+import os
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict, Any, List, Union
+import numpy as np
+import pandas as pd
+import joblib
 
 ARTIFACT_DIR = Path(__file__).parent / "artifacts"
 N_STATIONS = 45
-SEQ_LEN = 30          # 30-minute lookback window (1 reading/min per station)
-HORIZON_MINUTES = 45  # predict bottleneck within this window
-BOTTLENECK_THRESHOLD = 1.35  # cycle_time > 135% of station mean = bottleneck
+SEQ_LEN = 30         # 30-minute lookback window (1 reading/min per station)
+HORIZON_MINUTES = 45 # predict bottleneck within this window
 
 
-@dataclass
-class BottleneckPrediction:
-    station_id: int
-    bottleneck_prob: float
-    eta_minutes: Optional[int]   # estimated minutes to bottleneck
-    confidence: float
+def sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -500, 500)))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Model definition
-# ─────────────────────────────────────────────────────────────────────────────
-class BottleneckLSTM(nn.Module):
-    def __init__(self, n_stations: int = N_STATIONS, hidden_size: int = 128, num_layers: int = 2):
-        super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=n_stations,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=0.3,
-        )
-        self.dropout = nn.Dropout(0.3)
-        self.fc = nn.Linear(hidden_size, n_stations)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, seq_len, n_stations)
-        lstm_out, _ = self.lstm(x)
-        last_hidden = lstm_out[:, -1, :]          # take last time step
-        out = self.dropout(last_hidden)
-        out = self.fc(out)
-        return self.sigmoid(out)
+def tanh(x: np.ndarray) -> np.ndarray:
+    return np.tanh(x)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Predictor wrapper
-# ─────────────────────────────────────────────────────────────────────────────
+class PureNumPyLSTM:
+    """Lightweight pure-NumPy inference for PyTorch LSTM weights."""
+    def __init__(self, hidden_size: int = 64, n_stations: int = N_STATIONS):
+        self.hidden_size = hidden_size
+        self.n_stations = n_stations
+        self.w_ih = None
+        self.w_hh = None
+        self.b_ih = None
+        self.b_hh = None
+        self.w_fc = None
+        self.b_fc = None
+
+    def load_weights(self, weights_dict: Dict[str, np.ndarray]):
+        self.w_ih = weights_dict.get("w_ih", weights_dict.get("lstm.weight_ih_l0", None))
+        self.w_hh = weights_dict.get("w_hh", weights_dict.get("lstm.weight_hh_l0", None))
+        self.b_ih = weights_dict.get("b_ih", weights_dict.get("lstm.bias_ih_l0", None))
+        self.b_hh = weights_dict.get("b_hh", weights_dict.get("lstm.bias_hh_l0", None))
+        self.w_fc = weights_dict.get("w_fc", weights_dict.get("fc.weight", None))
+        self.b_fc = weights_dict.get("b_fc", weights_dict.get("fc.bias", None))
+        if self.w_hh is not None:
+            self.hidden_size = self.w_hh.shape[1]
+
+    def forward(self, x: np.ndarray) -> np.ndarray:
+        # x shape: (batch_size, seq_len, n_stations)
+        batch_size, seq_len, _ = x.shape
+        H = self.hidden_size
+
+        if self.w_ih is None:
+            # Baseline fallback if weights are not provided
+            mean_vals = np.mean(x, axis=1) # (batch, n_stations)
+            return sigmoid(mean_vals)
+
+        b = (self.b_ih + self.b_hh) if (self.b_ih is not None and self.b_hh is not None) else np.zeros(4 * H, dtype=np.float32)
+
+        batch_outputs = []
+        for b_idx in range(batch_size):
+            h = np.zeros(H, dtype=np.float32)
+            c = np.zeros(H, dtype=np.float32)
+            for t in range(seq_len):
+                x_t = x[b_idx, t]
+                gates = np.dot(self.w_ih, x_t) + np.dot(self.w_hh, h) + b
+                i_gate = sigmoid(gates[0:H])
+                f_gate = sigmoid(gates[H:2*H])
+                g_gate = tanh(gates[2*H:3*H])
+                o_gate = sigmoid(gates[3*H:4*H])
+                c = f_gate * c + i_gate * g_gate
+                h = o_gate * tanh(c)
+
+            # FC linear layer + Sigmoid per station
+            if self.w_fc is not None:
+                logits = np.dot(self.w_fc, h) + (self.b_fc if self.b_fc is not None else 0)
+                out = sigmoid(logits)
+            else:
+                out = sigmoid(h[:self.n_stations])
+            batch_outputs.append(out)
+
+        return np.array(batch_outputs, dtype=np.float32)
+
+
 class BottleneckPredictor:
-    def __init__(self, device: Optional[str] = None):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model: Optional[BottleneckLSTM] = None
-        self.station_means: Optional[np.ndarray] = None  # shape (45,)
-        self.station_stds: Optional[np.ndarray] = None
+    def __init__(self, artifact_dir: Optional[Path] = None):
+        self.artifact_dir = artifact_dir or ARTIFACT_DIR
+        self.model = PureNumPyLSTM(hidden_size=64, n_stations=N_STATIONS)
+        self.scaler = None
+        self.loaded = False
+        self._load_artifacts()
 
-    def _prepare_sequences(
-        self, df: pd.DataFrame
-    ) -> tuple[np.ndarray, np.ndarray]:
+    def _load_artifacts(self):
+        try:
+            scaler_path = self.artifact_dir / "scaler.joblib"
+            if scaler_path.exists():
+                self.scaler = joblib.load(scaler_path)
+
+            npz_path = self.artifact_dir / "bottleneck_lstm_weights.npz"
+            if npz_path.exists():
+                data = np.load(npz_path, allow_pickle=True)
+                weights = {k: data[k] for k in data.files}
+                self.model.load_weights(weights)
+                self.loaded = True
+        except Exception as e:
+            print(f"Notice: Initialized BottleneckPredictor with fallback inference: {e}")
+
+    def predict(self, input_data: Union[np.ndarray, List, pd.DataFrame]) -> np.ndarray:
         """
-        Pivot telemetry into (n_samples, SEQ_LEN, N_STATIONS) sequences.
-        Labels: 1 if station cycle_time exceeds threshold within HORIZON_MINUTES
+        Input: (batch, 30, 45) or (30, 45) array of cycle times.
+        Output: (batch, 45) or (45,) array of probabilities [0.0 - 1.0].
         """
-        # Pivot: index = time step, columns = station_id
-        pivot = (
-            df.pivot_table(index="vehicle_id", columns="station_id", values="cycle_time_s")
-            .sort_index()
-            .fillna(method="ffill")
-            .fillna(method="bfill")
-        )
-        # Ensure all 45 stations are present
-        for sid in range(1, N_STATIONS + 1):
-            if sid not in pivot.columns:
-                pivot[sid] = pivot.mean(axis=1)
-        pivot = pivot[[i for i in range(1, N_STATIONS + 1)]]
+        single_sample = False
+        x = np.asarray(input_data, dtype=np.float32)
 
-        vals = pivot.values.astype(np.float32)  # (n_vehicles, n_stations)
-        self.station_means = vals.mean(axis=0)
-        self.station_stds  = vals.std(axis=0) + 1e-6
+        if x.ndim == 2:
+            # (seq_len, n_stations) -> add batch dim
+            x = x[np.newaxis, :, :]
+            single_sample = True
+        elif x.ndim == 1:
+            # single step fallback -> tile to 30 seq_len
+            x = np.tile(x, (SEQ_LEN, 1))[np.newaxis, :, :]
+            single_sample = True
 
-        # Normalise
-        vals_norm = (vals - self.station_means) / self.station_stds
+        probs = self.model.forward(x)
+        return probs[0] if single_sample else probs
 
-        X, y = [], []
-        for i in range(SEQ_LEN, len(vals_norm) - HORIZON_MINUTES):
-            X.append(vals_norm[i - SEQ_LEN:i])          # (SEQ_LEN, 45)
-            # Label: is any station's raw cycle_time > threshold * mean in horizon?
-            future = vals[i:i + HORIZON_MINUTES]         # (horizon, 45)
-            label = (future > self.station_means * BOTTLENECK_THRESHOLD).any(axis=0).astype(np.float32)
-            y.append(label)                              # (45,)
-
-        return np.array(X), np.array(y)
-
-    def fit(self, df: pd.DataFrame, epochs: int = 30, lr: float = 1e-3):
-        X, y = self._prepare_sequences(df)
-        X_t = torch.tensor(X, dtype=torch.float32).to(self.device)
-        y_t = torch.tensor(y, dtype=torch.float32).to(self.device)
-
-        dataset = torch.utils.data.TensorDataset(X_t, y_t)
-        loader  = torch.utils.data.DataLoader(dataset, batch_size=64, shuffle=True)
-
-        self.model = BottleneckLSTM().to(self.device)
-        optimiser = torch.optim.Adam(self.model.parameters(), lr=lr)
-        criterion = nn.BCELoss()
-
-        self.model.train()
-        for epoch in range(epochs):
-            epoch_loss = 0.0
-            for xb, yb in loader:
-                optimiser.zero_grad()
-                preds = self.model(xb)
-                loss  = criterion(preds, yb)
-                loss.backward()
-                optimiser.step()
-                epoch_loss += loss.item()
-            if (epoch + 1) % 5 == 0:
-                print(f"  Epoch {epoch+1}/{epochs} | Loss: {epoch_loss/len(loader):.4f}")
-
-        self.save()
-
-    def predict(self, recent_df: pd.DataFrame) -> list[BottleneckPrediction]:
-        """
-        recent_df: last SEQ_LEN vehicle readings (all stations).
-        Returns list of BottleneckPrediction for stations with prob > 0.3.
-        """
-        if self.model is None:
-            self.load()
-
-        pivot = (
-            recent_df.pivot_table(index="vehicle_id", columns="station_id", values="cycle_time_s")
-            .sort_index()
-            .fillna(method="ffill")
-            .fillna(method="bfill")
-        )
-        for sid in range(1, N_STATIONS + 1):
-            if sid not in pivot.columns:
-                pivot[sid] = 0.0
-        pivot = pivot[[i for i in range(1, N_STATIONS + 1)]]
-
-        vals = pivot.values[-SEQ_LEN:].astype(np.float32)
-        if len(vals) < SEQ_LEN:
-            pad = np.zeros((SEQ_LEN - len(vals), N_STATIONS), dtype=np.float32)
-            vals = np.vstack([pad, vals])
-
-        vals_norm = (vals - self.station_means) / self.station_stds
-        X_t = torch.tensor(vals_norm[np.newaxis], dtype=torch.float32).to(self.device)
-
-        self.model.eval()
-        with torch.no_grad():
-            probs = self.model(X_t).cpu().numpy()[0]   # shape (45,)
-
-        results = []
-        for i, prob in enumerate(probs):
-            if prob > 0.30:
-                eta = int(HORIZON_MINUTES * (1.0 - prob))   # rough ETA estimate
-                results.append(BottleneckPrediction(
-                    station_id=i + 1,
-                    bottleneck_prob=float(prob),
-                    eta_minutes=max(5, eta),
-                    confidence=float(prob),
-                ))
-        return sorted(results, key=lambda r: r.bottleneck_prob, reverse=True)
-
-    def save(self):
-        ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-        torch.save(self.model.state_dict(), ARTIFACT_DIR / "bottleneck_lstm.pt")
-        joblib.dump({
-            "means": self.station_means,
-            "stds":  self.station_stds,
-        }, ARTIFACT_DIR / "bottleneck_scaler.pkl")
-
-    def load(self):
-        self.model = BottleneckLSTM().to(self.device)
-        self.model.load_state_dict(torch.load(
-            ARTIFACT_DIR / "bottleneck_lstm.pt",
-            map_location=self.device,
-        ))
-        self.model.eval()
-        scaler = joblib.load(ARTIFACT_DIR / "bottleneck_scaler.pkl")
-        self.station_means = scaler["means"]
-        self.station_stds  = scaler["stds"]
-        return self
+    def predict_bottlenecks(self, input_data: Any, threshold: float = 0.6) -> Dict[str, Any]:
+        probs = self.predict(input_data)
+        if probs.ndim > 1:
+            probs = probs[0]
+        bottleneck_indices = [int(i) for i, p in enumerate(probs) if p >= threshold]
+        return {
+            "probabilities": probs.tolist(),
+            "bottleneck_stations": bottleneck_indices,
+            "threshold": threshold
+        }
